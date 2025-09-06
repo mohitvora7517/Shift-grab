@@ -39,6 +39,7 @@ class AmazonJobMonitor:
                 "check_interval": 30,  # seconds
                 "max_attempts": 1000,
                 "headless": True,
+                "stop_after_success": True,  # Stop monitoring after successful application
                 "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
                 "notifications": {
                     "email": {
@@ -85,6 +86,24 @@ class AmazonJobMonitor:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
+        # Reduce warnings and improve performance
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-features=TranslateUI")
+        chrome_options.add_argument("--disable-ipc-flooding-protection")
+        chrome_options.add_argument("--disable-logging")
+        chrome_options.add_argument("--silent")
+        chrome_options.add_argument("--log-level=3")
+        
+        # Preserve login session - only disable problematic caches
+        chrome_options.add_argument("--disable-application-cache")
+        chrome_options.add_argument("--disable-offline-load-stale-cache")
+        # Keep cookies and session data for login persistence
+        chrome_options.add_argument("--enable-features=NetworkService,NetworkServiceLogging")
+        
         try:
             self.driver = webdriver.Chrome(options=chrome_options)
             self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -96,8 +115,20 @@ class AmazonJobMonitor:
     def check_job_availability(self, job_url):
         """Check if a job is available for application."""
         try:
+            # Navigate to job page (preserve login session)
             self.driver.get(job_url)
-            time.sleep(3)  # Wait for page to load
+            
+            # Wait for page to fully load
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Additional wait for dynamic content
+            time.sleep(2)
+            
+            # Force refresh to get latest data (but keep session)
+            self.driver.refresh()
+            time.sleep(3)
             
             # Check for the warning banner that indicates job is not available
             try:
@@ -151,11 +182,17 @@ class AmazonJobMonitor:
             # Wait a moment to see if any additional steps are required
             time.sleep(5)
             
-            # Check if we're redirected to an application form
+            # Check if we're redirected to an application form or logged in
             current_url = self.driver.current_url
-            if "application" in current_url.lower() or "apply" in current_url.lower():
-                self.logger.info("Redirected to application form")
-                return True, "Application process started"
+            page_source = self.driver.page_source.lower()
+            
+            # Check for various success indicators
+            if any(indicator in current_url.lower() for indicator in ["application", "apply", "profile", "dashboard"]):
+                self.logger.info("Redirected to application form or user dashboard")
+                return True, "Application process started - user is logged in"
+            elif any(indicator in page_source for indicator in ["welcome", "dashboard", "profile", "application"]):
+                self.logger.info("User appears to be logged in and on application page")
+                return True, "Application process started - user is logged in"
             else:
                 return True, "Apply button clicked successfully"
                 
@@ -215,6 +252,30 @@ class AmazonJobMonitor:
         except Exception as e:
             self.logger.error(f"Failed to send email notification: {e}")
     
+    def restart_browser(self):
+        """Restart browser to ensure fresh session (preserves login)."""
+        try:
+            if self.driver:
+                # Save current cookies before restarting
+                cookies = self.driver.get_cookies()
+                self.driver.quit()
+                self.logger.info("Restarting browser for fresh session...")
+                time.sleep(2)
+                
+                # Setup new driver
+                if self.setup_driver():
+                    # Restore cookies to maintain login
+                    for cookie in cookies:
+                        try:
+                            self.driver.add_cookie(cookie)
+                        except:
+                            pass  # Skip invalid cookies
+                    return True
+                return False
+        except Exception as e:
+            self.logger.error(f"Error restarting browser: {e}")
+            return False
+
     def monitor_jobs(self):
         """Main monitoring loop."""
         self.logger.info("Starting Amazon Job Monitor...")
@@ -227,9 +288,18 @@ class AmazonJobMonitor:
         
         try:
             attempt = 0
+            browser_restart_interval = 50  # Restart browser every 50 checks
+            
             while attempt < self.config.get("max_attempts", 1000):
                 attempt += 1
                 self.logger.info(f"Check attempt #{attempt}")
+                
+                # Restart browser periodically for fresh session
+                if attempt % browser_restart_interval == 0:
+                    self.logger.info("Restarting browser for fresh session...")
+                    if not self.restart_browser():
+                        self.logger.error("Failed to restart browser. Exiting.")
+                        break
                 
                 for i, job_url in enumerate(self.config['job_urls']):
                     self.logger.info(f"Checking job {i+1}/{len(self.config['job_urls'])}")
@@ -245,6 +315,13 @@ class AmazonJobMonitor:
                         if success:
                             self.send_notification(f"Successfully applied! {result}", job_url)
                             self.logger.info("Application submitted successfully!")
+                            
+                            # Check if user is logged in and on application page
+                            if self.config.get("stop_after_success", True) and ("logged in" in result.lower() or "application" in result.lower()):
+                                self.logger.info("🎉 SUCCESS! User is logged in and application process started!")
+                                self.logger.info("🛑 Stopping monitoring - job application successful!")
+                                self.send_notification("🎉 JOB APPLICATION SUCCESSFUL! Monitoring stopped.", job_url)
+                                return  # Stop monitoring completely
                         else:
                             self.send_notification(f"Failed to apply: {result}", job_url)
                             self.logger.error(f"Failed to apply: {result}")
