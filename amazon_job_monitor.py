@@ -97,6 +97,13 @@ class AmazonJobMonitor:
         chrome_options.add_argument("--silent")
         chrome_options.add_argument("--log-level=3")
         
+        # Disable caching to ensure fresh data
+        chrome_options.add_argument("--disable-application-cache")
+        chrome_options.add_argument("--disable-offline-load-stale-cache")
+        chrome_options.add_argument("--disk-cache-size=0")
+        chrome_options.add_argument("--media-cache-size=0")
+        chrome_options.add_argument("--aggressive-cache-discard")
+        
         try:
             self.driver = webdriver.Chrome(options=chrome_options)
             self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -108,8 +115,21 @@ class AmazonJobMonitor:
     def check_job_availability(self, job_url):
         """Check if a job is available for application."""
         try:
+            # Force a fresh page load with cache clearing
+            self.driver.delete_all_cookies()
             self.driver.get(job_url)
-            time.sleep(3)  # Wait for page to load
+            
+            # Wait for page to fully load
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Additional wait for dynamic content
+            time.sleep(2)
+            
+            # Force refresh to get latest data
+            self.driver.refresh()
+            time.sleep(3)
             
             # Check for the warning banner that indicates job is not available
             try:
@@ -227,6 +247,18 @@ class AmazonJobMonitor:
         except Exception as e:
             self.logger.error(f"Failed to send email notification: {e}")
     
+    def restart_browser(self):
+        """Restart browser to ensure fresh session."""
+        try:
+            if self.driver:
+                self.driver.quit()
+                self.logger.info("Restarting browser for fresh session...")
+                time.sleep(2)
+                return self.setup_driver()
+        except Exception as e:
+            self.logger.error(f"Error restarting browser: {e}")
+            return False
+
     def monitor_jobs(self):
         """Main monitoring loop."""
         self.logger.info("Starting Amazon Job Monitor...")
@@ -239,9 +271,18 @@ class AmazonJobMonitor:
         
         try:
             attempt = 0
+            browser_restart_interval = 50  # Restart browser every 50 checks
+            
             while attempt < self.config.get("max_attempts", 1000):
                 attempt += 1
                 self.logger.info(f"Check attempt #{attempt}")
+                
+                # Restart browser periodically for fresh session
+                if attempt % browser_restart_interval == 0:
+                    self.logger.info("Restarting browser for fresh session...")
+                    if not self.restart_browser():
+                        self.logger.error("Failed to restart browser. Exiting.")
+                        break
                 
                 for i, job_url in enumerate(self.config['job_urls']):
                     self.logger.info(f"Checking job {i+1}/{len(self.config['job_urls'])}")
